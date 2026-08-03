@@ -1,0 +1,11 @@
+bin/
+dist/
+.idea/
+.vscode/
+*.exe
+*.test
+*.out
+.env
+.DS_Store
+coverage.out
+vendor/
