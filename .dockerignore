@@ -1,0 +1,9 @@
+.git
+.github
+.env
+*.md
+bin/
+dist/
+.idea/
+.vscode/
+**/*_test.go
