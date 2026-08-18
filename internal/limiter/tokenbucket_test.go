@@ -2,42 +2,68 @@ package limiter
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 )
 
-func TestTokenBucketAllowsBurstThenLimits(t *testing.T) {
-	t.Parallel()
-	tb := NewTokenBucket(10, 3)
-	ctx := context.Background()
+type fakeClock struct{ t time.Time }
 
-	start := time.Now()
-	for i := 0; i < 3; i++ {
-		if err := tb.Wait(ctx, "k"); err != nil {
-			t.Fatal(err)
+func (c *fakeClock) now() time.Time          { return c.t }
+func (c *fakeClock) advance(d time.Duration) { c.t = c.t.Add(d) }
+
+func TestTokenBucketBurstThenRefill(t *testing.T) {
+	t.Parallel()
+	clock := &fakeClock{t: time.Unix(0, 0)}
+	tb := NewTokenBucket(10, 3)
+	tb.now = clock.now
+
+	for i := range 3 {
+		if ok, _ := tb.Allow("k"); !ok {
+			t.Fatalf("burst token %d denied", i)
 		}
 	}
-	if time.Since(start) > 50*time.Millisecond {
-		t.Fatalf("burst should be immediate, took %s", time.Since(start))
+	ok, wait := tb.Allow("k")
+	if ok || wait != 100*time.Millisecond {
+		t.Fatalf("expected denial with 100ms wait, got ok=%v wait=%s", ok, wait)
 	}
-
-	start = time.Now()
-	if err := tb.Wait(ctx, "k"); err != nil {
-		t.Fatal(err)
-	}
-	if time.Since(start) < 50*time.Millisecond {
-		t.Fatalf("expected rate limit wait, took %s", time.Since(start))
+	clock.advance(100 * time.Millisecond)
+	if ok, _ := tb.Allow("k"); !ok {
+		t.Fatal("token should refill after 100ms at 10 rps")
 	}
 }
 
-func TestTokenBucketCancel(t *testing.T) {
+func TestTokenBucketKeysAreIndependent(t *testing.T) {
 	t.Parallel()
-	tb := NewTokenBucket(0.1, 1)
-	ctx, cancel := context.WithCancel(context.Background())
-	_ = tb.Wait(ctx, "x") // take the only token
-	cancel()
-	err := tb.Wait(ctx, "x")
-	if err == nil {
-		t.Fatal("expected context error")
+	clock := &fakeClock{t: time.Unix(0, 0)}
+	tb := NewTokenBucket(1, 1)
+	tb.now = clock.now
+	if ok, _ := tb.Allow("wb:orders.upsert"); !ok {
+		t.Fatal("first key denied")
 	}
+	if ok, _ := tb.Allow("ozon:orders.upsert"); !ok {
+		t.Fatal("second key should have its own bucket")
+	}
+}
+
+func TestTokenBucketWaitHonoursContext(t *testing.T) {
+	t.Parallel()
+	tb := NewTokenBucket(0.01, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := tb.Wait(ctx, "x"); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	if err := tb.Wait(ctx, "x"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+}
+
+func BenchmarkTokenBucketAllow(b *testing.B) {
+	tb := NewTokenBucket(1e9, 1e6)
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			tb.Allow("bench")
+		}
+	})
 }

@@ -8,124 +8,163 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+
 	"github.com/ordersync/platform/internal/domain"
 )
 
-func (s *Store) CreateSyncJob(ctx context.Context, source string, freshVolume, batchSize int) (domain.SyncJob, error) {
+const jobColumns = `j.id, j.status, j.trigger_source, COALESCE(j.worker_id, ''), j.fresh_volume, j.batches,
+	j.last_batch_size, j.orders_claimed, j.orders_done, j.orders_failed, COALESCE(j.error_message, ''),
+	j.started_at, j.finished_at, j.created_at`
+
+func scanJob(row pgx.Row) (domain.SyncJob, error) {
 	var j domain.SyncJob
-	err := s.pool.QueryRow(ctx, `
-		INSERT INTO sync_jobs (status, trigger_source, fresh_volume, batch_size)
-		VALUES ('queued', $1, $2, $3)
-		RETURNING id, status, trigger_source, fresh_volume, batch_size, orders_queued, orders_done, orders_failed,
-		          COALESCE(error_message, ''), started_at, finished_at, created_at
-	`, source, freshVolume, batchSize).Scan(
-		&j.ID, &j.Status, &j.TriggerSource, &j.FreshVolume, &j.BatchSize,
-		&j.OrdersQueued, &j.OrdersDone, &j.OrdersFailed, &j.ErrorMessage,
-		&j.StartedAt, &j.FinishedAt, &j.CreatedAt,
-	)
-	if err != nil {
-		return domain.SyncJob{}, fmt.Errorf("create sync job: %w", err)
-	}
-	return j, nil
+	err := row.Scan(&j.ID, &j.Status, &j.TriggerSource, &j.WorkerID, &j.FreshVolume, &j.Batches, &j.LastBatchSize,
+		&j.OrdersClaimed, &j.OrdersDone, &j.OrdersFailed, &j.ErrorMessage, &j.StartedAt, &j.FinishedAt, &j.CreatedAt)
+	return j, err
 }
 
-func (s *Store) ClaimNextJob(ctx context.Context) (domain.SyncJob, bool, error) {
-	var j domain.SyncJob
-	err := s.pool.QueryRow(ctx, `
-		WITH cte AS (
+// EnsureQueuedJob returns the single queued job, creating it if none exists.
+// The partial unique index makes concurrent triggers converge on one row.
+func (s *Store) EnsureQueuedJob(ctx context.Context, source string) (domain.SyncJob, bool, error) {
+	for range 3 {
+		job, err := scanJob(s.pool.QueryRow(ctx, `
+			INSERT INTO sync_jobs AS j (status, trigger_source)
+			VALUES ('queued', $1)
+			ON CONFLICT (status) WHERE status = 'queued' DO NOTHING
+			RETURNING `+jobColumns, source))
+		if err == nil {
+			return job, true, nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return domain.SyncJob{}, false, fmt.Errorf("create sync job: %w", err)
+		}
+		job, err = scanJob(s.pool.QueryRow(ctx,
+			`SELECT `+jobColumns+` FROM sync_jobs j WHERE j.status = 'queued'`))
+		if err == nil {
+			return job, false, nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return domain.SyncJob{}, false, fmt.Errorf("load queued job: %w", err)
+		}
+		// The queued job was claimed between our insert and select; retry.
+	}
+	return domain.SyncJob{}, false, errors.New("ensure queued job: too much contention")
+}
+
+func (s *Store) ClaimNextJob(ctx context.Context, workerID string, freshVolume int, lease time.Duration) (domain.SyncJob, bool, error) {
+	job, err := scanJob(s.pool.QueryRow(ctx, `
+		WITH next AS (
 			SELECT id FROM sync_jobs
 			WHERE status = 'queued'
 			ORDER BY created_at
 			LIMIT 1
 			FOR UPDATE SKIP LOCKED
 		)
-		UPDATE sync_jobs sj
-		SET status = 'running', started_at = now()
-		FROM cte
-		WHERE sj.id = cte.id
-		RETURNING sj.id, sj.status, sj.trigger_source, sj.fresh_volume, sj.batch_size,
-		          sj.orders_queued, sj.orders_done, sj.orders_failed,
-		          COALESCE(sj.error_message, ''), sj.started_at, sj.finished_at, sj.created_at
-	`).Scan(
-		&j.ID, &j.Status, &j.TriggerSource, &j.FreshVolume, &j.BatchSize,
-		&j.OrdersQueued, &j.OrdersDone, &j.OrdersFailed, &j.ErrorMessage,
-		&j.StartedAt, &j.FinishedAt, &j.CreatedAt,
-	)
+		UPDATE sync_jobs j
+		SET status       = 'running',
+		    worker_id    = $1,
+		    fresh_volume = $2,
+		    started_at   = now(),
+		    lease_until  = now() + $3 * interval '1 millisecond'
+		FROM next
+		WHERE j.id = next.id
+		RETURNING `+jobColumns, workerID, freshVolume, millis(lease)))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.SyncJob{}, false, nil
+	}
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.SyncJob{}, false, nil
-		}
 		return domain.SyncJob{}, false, fmt.Errorf("claim next job: %w", err)
 	}
-	return j, true, nil
+	return job, true, nil
 }
 
-func (s *Store) UpdateJobProgress(ctx context.Context, id uuid.UUID, queued, done, failed int) error {
-	_, err := s.pool.Exec(ctx, `
+// RecordBatch accumulates batch counters and doubles as the job heartbeat.
+func (s *Store) RecordBatch(ctx context.Context, jobID uuid.UUID, workerID string, r domain.BatchResult, lease time.Duration) error {
+	tag, err := s.pool.Exec(ctx, `
 		UPDATE sync_jobs
-		SET orders_queued = $2, orders_done = $3, orders_failed = $4
-		WHERE id = $1
-	`, id, queued, done, failed)
+		SET batches         = batches + 1,
+		    last_batch_size = $3,
+		    orders_claimed  = orders_claimed + $3,
+		    orders_done     = orders_done + $4,
+		    orders_failed   = orders_failed + $5,
+		    lease_until     = now() + $6 * interval '1 millisecond'
+		WHERE id = $1 AND worker_id = $2 AND status = 'running'`,
+		jobID, workerID, r.Size, r.Done, r.Failed, millis(lease))
 	if err != nil {
-		return fmt.Errorf("update job progress: %w", err)
+		return fmt.Errorf("record batch: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return domain.ErrLeaseLost
 	}
 	return nil
 }
 
-func (s *Store) FinishJob(ctx context.Context, id uuid.UUID, status domain.JobStatus, errMsg string) error {
-	now := time.Now().UTC()
-	_, err := s.pool.Exec(ctx, `
+func (s *Store) FinishJob(ctx context.Context, jobID uuid.UUID, workerID string, status domain.JobStatus, errMsg string) error {
+	return s.inTx(ctx, func(tx pgx.Tx) error {
+		job, err := scanJob(tx.QueryRow(ctx, `
+			UPDATE sync_jobs j
+			SET status        = $3,
+			    error_message = NULLIF($4, ''),
+			    finished_at   = now(),
+			    lease_until   = NULL
+			WHERE id = $1 AND worker_id = $2 AND status = 'running'
+			RETURNING `+jobColumns, jobID, workerID, status, truncate(errMsg, 500)))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrLeaseLost
+		}
+		if err != nil {
+			return fmt.Errorf("finish job: %w", err)
+		}
+		return insertOutbox(ctx, tx, domain.AggregateSyncJob, job.ID.String(), domain.EventJobFinished, map[string]any{
+			"job_id":         job.ID,
+			"status":         job.Status,
+			"worker_id":      job.WorkerID,
+			"batches":        job.Batches,
+			"orders_claimed": job.OrdersClaimed,
+			"orders_done":    job.OrdersDone,
+			"orders_failed":  job.OrdersFailed,
+		})
+	})
+}
+
+// FailExpiredJobs closes jobs whose worker stopped heartbeating. Their orders
+// are recovered independently through order leases.
+func (s *Store) FailExpiredJobs(ctx context.Context) (int, error) {
+	tag, err := s.pool.Exec(ctx, `
 		UPDATE sync_jobs
-		SET status = $2, error_message = NULLIF($3, ''), finished_at = $4
-		WHERE id = $1
-	`, id, status, errMsg, now)
+		SET status = 'failed', error_message = 'worker lease expired', finished_at = now(), lease_until = NULL
+		WHERE status = 'running' AND lease_until < now()`)
 	if err != nil {
-		return fmt.Errorf("finish job: %w", err)
+		return 0, fmt.Errorf("fail expired jobs: %w", err)
 	}
-	return nil
+	return int(tag.RowsAffected()), nil
 }
 
 func (s *Store) GetJob(ctx context.Context, id uuid.UUID) (domain.SyncJob, error) {
-	var j domain.SyncJob
-	err := s.pool.QueryRow(ctx, `
-		SELECT id, status, trigger_source, fresh_volume, batch_size, orders_queued, orders_done, orders_failed,
-		       COALESCE(error_message, ''), started_at, finished_at, created_at
-		FROM sync_jobs WHERE id = $1
-	`, id).Scan(
-		&j.ID, &j.Status, &j.TriggerSource, &j.FreshVolume, &j.BatchSize,
-		&j.OrdersQueued, &j.OrdersDone, &j.OrdersFailed, &j.ErrorMessage,
-		&j.StartedAt, &j.FinishedAt, &j.CreatedAt,
-	)
+	job, err := scanJob(s.pool.QueryRow(ctx, `SELECT `+jobColumns+` FROM sync_jobs j WHERE j.id = $1`, id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.SyncJob{}, ErrNotFound
+	}
 	if err != nil {
 		return domain.SyncJob{}, fmt.Errorf("get job: %w", err)
 	}
-	return j, nil
+	return job, nil
 }
 
 func (s *Store) ListRecentJobs(ctx context.Context, limit int) ([]domain.SyncJob, error) {
-	rows, err := s.pool.Query(ctx, `
-		SELECT id, status, trigger_source, fresh_volume, batch_size, orders_queued, orders_done, orders_failed,
-		       COALESCE(error_message, ''), started_at, finished_at, created_at
-		FROM sync_jobs
-		ORDER BY created_at DESC
-		LIMIT $1
-	`, limit)
+	rows, err := s.pool.Query(ctx, `SELECT `+jobColumns+` FROM sync_jobs j ORDER BY j.created_at DESC LIMIT $1`, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list jobs: %w", err)
 	}
 	defer rows.Close()
 
-	var out []domain.SyncJob
+	jobs := []domain.SyncJob{}
 	for rows.Next() {
-		var j domain.SyncJob
-		if err := rows.Scan(
-			&j.ID, &j.Status, &j.TriggerSource, &j.FreshVolume, &j.BatchSize,
-			&j.OrdersQueued, &j.OrdersDone, &j.OrdersFailed, &j.ErrorMessage,
-			&j.StartedAt, &j.FinishedAt, &j.CreatedAt,
-		); err != nil {
-			return nil, err
+		job, err := scanJob(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan job: %w", err)
 		}
-		out = append(out, j)
+		jobs = append(jobs, job)
 	}
-	return out, rows.Err()
+	return jobs, rows.Err()
 }

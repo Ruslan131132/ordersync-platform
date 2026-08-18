@@ -6,17 +6,19 @@ import (
 )
 
 const (
-	EventOrderSynced  = "order.synced"
-	EventOrderFailed  = "order.failed"
-	EventJobCompleted = "sync_job.completed"
+	AggregateOrder   = "order"
+	AggregateSyncJob = "sync_job"
+
+	EventOrderSynced       = "order.synced"
+	EventOrderDeadLettered = "order.dead_lettered"
+	EventJobFinished       = "sync_job.finished"
 )
 
 type OutboxEvent struct {
-	ID            int64
-	AggregateType string
-	AggregateID   string
-	EventType     string
-	Payload       json.RawMessage
-	CreatedAt     time.Time
-	PublishedAt   *time.Time
+	ID            int64           `json:"id"`
+	AggregateType string          `json:"aggregate_type"`
+	AggregateID   string          `json:"aggregate_id"`
+	EventType     string          `json:"event_type"`
+	Payload       json.RawMessage `json:"payload"`
+	CreatedAt     time.Time       `json:"created_at"`
 }

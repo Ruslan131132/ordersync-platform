@@ -2,18 +2,25 @@ package limiter
 
 import (
 	"context"
+	"math"
 	"sync"
 	"time"
 )
 
-// TokenBucket is an in-process token-bucket limiter keyed by method/token.
-// For multi-instance fairness Redis would hold the shared state; here each
-// worker process owns its local allowance, matching the mock's per-token model.
+// Limiter blocks until a request under key may proceed.
+type Limiter interface {
+	Wait(ctx context.Context, key string) error
+}
+
+// TokenBucket is an in-process limiter keyed by an arbitrary string. The mock
+// marketplace uses it server-side; workers use RedisLimiter so replicas share
+// one budget per token.
 type TokenBucket struct {
 	mu      sync.Mutex
 	buckets map[string]*bucket
 	rate    float64
 	burst   float64
+	now     func() time.Time
 }
 
 type bucket struct {
@@ -22,53 +29,56 @@ type bucket struct {
 }
 
 func NewTokenBucket(rps float64, burst int) *TokenBucket {
-	if rps <= 0 {
-		rps = 1
-	}
-	if burst < 1 {
-		burst = 1
-	}
 	return &TokenBucket{
 		buckets: make(map[string]*bucket),
-		rate:    rps,
-		burst:   float64(burst),
+		rate:    math.Max(rps, 0.001),
+		burst:   float64(max(burst, 1)),
+		now:     time.Now,
 	}
+}
+
+// Allow takes a token if available; otherwise it reports how long until one is.
+func (t *TokenBucket) Allow(key string) (bool, time.Duration) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	now := t.now()
+	b, ok := t.buckets[key]
+	if !ok {
+		b = &bucket{tokens: t.burst, last: now}
+		t.buckets[key] = b
+	}
+	elapsed := now.Sub(b.last).Seconds()
+	if elapsed > 0 {
+		b.tokens = math.Min(t.burst, b.tokens+elapsed*t.rate)
+		b.last = now
+	}
+	if b.tokens >= 1 {
+		b.tokens--
+		return true, 0
+	}
+	return false, time.Duration((1 - b.tokens) / t.rate * float64(time.Second))
 }
 
 func (t *TokenBucket) Wait(ctx context.Context, key string) error {
 	for {
-		wait, ok := t.tryTake(key)
+		ok, wait := t.Allow(key)
 		if ok {
 			return nil
 		}
-		timer := time.NewTimer(wait)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-timer.C:
+		if err := sleep(ctx, wait); err != nil {
+			return err
 		}
 	}
 }
 
-func (t *TokenBucket) tryTake(key string) (time.Duration, bool) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	now := time.Now()
-	b, ok := t.buckets[key]
-	if !ok {
-		t.buckets[key] = &bucket{tokens: t.burst - 1, last: now}
-		return 0, true
+func sleep(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
-
-	elapsed := now.Sub(b.last).Seconds()
-	b.tokens = min(t.burst, b.tokens+elapsed*t.rate)
-	b.last = now
-	if b.tokens >= 1 {
-		b.tokens--
-		return 0, true
-	}
-	need := (1 - b.tokens) / t.rate
-	return time.Duration(need * float64(time.Second)), false
 }

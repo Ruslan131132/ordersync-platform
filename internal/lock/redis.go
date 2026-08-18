@@ -11,11 +11,10 @@ import (
 
 var ErrNotAcquired = errors.New("lock not acquired")
 
-// RedisLocker implements a simple SET NX PX distributed lock with Lua unlock.
-// Chosen over Postgres advisory locks because:
-//  1. Lock TTL + worker identity fit Redis naturally for crash recovery.
-//  2. Keeps OLTP Postgres free of lock churn under multi-worker contention.
-//  3. Matches common marketplace-integration ops patterns (Redis as coordination).
+// RedisLocker is a single-instance Redis lease lock (SET NX PX + owner token).
+// It is used for leader election, where a brief overlap after a network
+// partition is harmless because all leader duties are idempotent SQL.
+// Per-order exclusivity does not rely on it: Postgres leases fence that.
 type RedisLocker struct {
 	client *redis.Client
 	prefix string
@@ -23,11 +22,10 @@ type RedisLocker struct {
 }
 
 func NewRedisLocker(client *redis.Client, prefix string, ttl time.Duration) *RedisLocker {
-	if ttl <= 0 {
-		ttl = 30 * time.Second
-	}
 	return &RedisLocker{client: client, prefix: prefix, ttl: ttl}
 }
+
+func (l *RedisLocker) TTL() time.Duration { return l.ttl }
 
 type Handle struct {
 	key   string
@@ -39,7 +37,7 @@ func (l *RedisLocker) Acquire(ctx context.Context, name, token string) (*Handle,
 	key := l.prefix + name
 	ok, err := l.client.SetNX(ctx, key, token, l.ttl).Result()
 	if err != nil {
-		return nil, fmt.Errorf("redis lock acquire %s: %w", name, err)
+		return nil, fmt.Errorf("acquire lock %s: %w", name, err)
 	}
 	if !ok {
 		return nil, ErrNotAcquired
@@ -47,53 +45,36 @@ func (l *RedisLocker) Acquire(ctx context.Context, name, token string) (*Handle,
 	return &Handle{key: key, token: token, l: l}, nil
 }
 
-func (l *RedisLocker) TryWithWait(ctx context.Context, name, token string, wait time.Duration) (*Handle, time.Duration, error) {
-	start := time.Now()
-	deadline := start.Add(wait)
-	for {
-		h, err := l.Acquire(ctx, name, token)
-		if err == nil {
-			return h, time.Since(start), nil
-		}
-		if !errors.Is(err, ErrNotAcquired) {
-			return nil, time.Since(start), err
-		}
-		if time.Now().After(deadline) {
-			return nil, time.Since(start), ErrNotAcquired
-		}
-		select {
-		case <-ctx.Done():
-			return nil, time.Since(start), ctx.Err()
-		case <-time.After(50 * time.Millisecond):
-		}
-	}
-}
-
-var unlockScript = redis.NewScript(`
+var releaseScript = redis.NewScript(`
 if redis.call("GET", KEYS[1]) == ARGV[1] then
   return redis.call("DEL", KEYS[1])
 end
 return 0
 `)
 
+var extendScript = redis.NewScript(`
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  return redis.call("PEXPIRE", KEYS[1], ARGV[2])
+end
+return 0
+`)
+
+// Release deletes the lock only if this handle still owns it.
 func (h *Handle) Release(ctx context.Context) error {
-	_, err := unlockScript.Run(ctx, h.l.client, []string{h.key}, h.token).Result()
-	if err != nil {
-		return fmt.Errorf("redis lock release: %w", err)
+	if err := releaseScript.Run(ctx, h.l.client, []string{h.key}, h.token).Err(); err != nil {
+		return fmt.Errorf("release lock: %w", err)
 	}
 	return nil
 }
 
+// Extend renews the TTL atomically; ErrNotAcquired means ownership was lost.
 func (h *Handle) Extend(ctx context.Context) error {
-	ok, err := h.l.client.Get(ctx, h.key).Result()
+	n, err := extendScript.Run(ctx, h.l.client, []string{h.key}, h.token, h.l.ttl.Milliseconds()).Int64()
 	if err != nil {
-		return fmt.Errorf("redis lock extend get: %w", err)
+		return fmt.Errorf("extend lock: %w", err)
 	}
-	if ok != h.token {
+	if n == 0 {
 		return ErrNotAcquired
-	}
-	if err := h.l.client.PExpire(ctx, h.key, h.l.ttl).Err(); err != nil {
-		return fmt.Errorf("redis lock extend: %w", err)
 	}
 	return nil
 }
